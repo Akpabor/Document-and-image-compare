@@ -168,9 +168,9 @@ with right:
     image_file = st.file_uploader("Lineup screenshot (PNG/JPG)", type=["png","jpg","jpeg"])
     st.caption("Crop to the two lineup columns only:")
     x0 = st.slider("Crop left %", 0, 40, 5)
-    x1 = st.slider("Crop right %", 60, 100, 98)
+    x1 = st.slider("Crop right %",0, 60, 100, 98)
     y0 = st.slider("Crop top %", 0, 40, 12)
-    y1 = st.slider("Crop bottom %", 60, 100, 95)
+    y1 = st.slider("Crop bottom %",0, 60, 100, 95)
 
 advanced = st.expander("OCR Advanced", expanded=False)
 with advanced:
