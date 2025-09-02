@@ -10,7 +10,7 @@ from pytesseract import TesseractNotFoundError
 
 st.set_page_config(page_title="Excel ↔ Lineup Comparator (Robust OCR, Fixed)", layout="wide")
 st.title("Excel ↔ Lineup Comparator (Robust OCR, Fixed)")
-st.caption("Fixes Tesseract config quoting and string handling; tries multiple OCR strategies, then exact-matches to Excel.")
+st.caption("Robust OCR with multiple strategies, exact-matching to Excel. Crop ranges fixed.")
 
 BASE_STOPWORDS = {
     "home","farm","heart","sacred","lineup","timeline","info","table","h2h","matches",
@@ -104,7 +104,6 @@ def ocr_try(img, psm: int):
     df = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME, config=cfg)
     if df is None or df.empty or "text" not in df.columns:
         return [], 0, 0
-    # Ensure string dtype for safe .str ops
     df = df.dropna(subset=["text"])
     if df.empty:
         return [], 0, 0
@@ -168,13 +167,14 @@ with right:
     image_file = st.file_uploader("Lineup screenshot (PNG/JPG)", type=["png","jpg","jpeg"])
     st.caption("Crop to the two lineup columns only:")
     x0 = st.slider("Crop left %", 0, 40, 5)
-    x1 = st.slider("Crop right %",0, 60, 100, 98)
+    x1 = st.slider("Crop right %", 60, 100, 98)
     y0 = st.slider("Crop top %", 0, 40, 12)
-    y1 = st.slider("Crop bottom %",0, 60, 100, 95)
+    # FIX: allow 0–100 instead of 60–100
+    y1 = st.slider("Crop bottom %", 0, 100, 95)
 
 advanced = st.expander("OCR Advanced", expanded=False)
 with advanced:
-    scale = st.slider("Upscale image", 1.0, 3.0, 1.8, step=0.1)
+    scale = st.slider("Upscale image", 1.0, 3.0, 2.0, step=0.1)
     invert = st.checkbox("Invert colors", value=False)
     sharpen = st.checkbox("Sharpen", value=True)
     show_attempts = st.checkbox("Show best attempt details", value=True)
