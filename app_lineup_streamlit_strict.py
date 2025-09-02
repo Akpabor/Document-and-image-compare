@@ -3,22 +3,24 @@ from typing import List, Optional, Tuple, Set, Dict
 
 import streamlit as st
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 
 import pytesseract
 from pytesseract import TesseractNotFoundError
 
-st.set_page_config(page_title="Excel ↔ Lineup Comparator (Strict)", layout="wide")
-st.title("Excel ↔ Lineup Comparator (Strict)")
-st.caption("OCRs a lineup screenshot and compares to Excel **exact-matching** normalized names. Extra junk text is filtered.")
+st.set_page_config(page_title="Excel ↔ Lineup Comparator (Robust OCR)", layout="wide")
+st.title("Excel ↔ Lineup Comparator (Robust OCR)")
+st.caption("Tries multiple OCR strategies (preprocessing, rotation, PSM) to extract names, then exact-matches to Excel.")
 
 BASE_STOPWORDS = {
     "home","farm","heart","sacred","lineup","timeline","info","table","h2h","matches",
     "substitution","substitutions","coach","g","c","lsl","fc","ireland",
     "vs","ft","ht","min","match","stadium","league","division","club",
-    # common OCR shrapnel from UI
     "hi","im","sd","co","ney","info","table","lineup","h2h"
 }
+
+PSM_LIST = [6, 4, 11, 12, 7, 3, 13]  # common good modes for blocks/lines
+ROTATIONS = [0, 90, 270]             # try portrait + rotated columns
 
 def normalize_text(s: str) -> str:
     s = s.strip().lower()
@@ -37,7 +39,7 @@ def tokens_ok(lastname: str, stopwords: Set[str]) -> bool:
     return True
 
 def name_to_last_initial(name: str, stopwords: Set[str]) -> Optional[str]:
-    """Convert a name-like string into 'lastname f.' (lowercase), allowing compound lastnames."""
+    """Convert arbitrary name-ish string into 'lastname f.' (lowercase)."""
     if not isinstance(name, str) or not name.strip():
         return None
     s = normalize_text(name)
@@ -86,35 +88,73 @@ def ensure_tesseract_available():
         )
         st.stop()
 
-def ocr_names(img: Image.Image, crop_box, stopwords: Set[str]) -> List[str]:
-    ensure_tesseract_available()
-    if crop_box:
-        img = img.crop(crop_box)
-    df = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME)
+def preprocess_variants(img: Image.Image, scale: float, invert: bool, sharpen: bool):
+    """Yield multiple preprocessed images for OCR attempts."""
+    base = img.convert("RGB")
+    w, h = base.size
+    if scale != 1.0:
+        base = base.resize((int(w*scale), int(h*scale)))
+    if invert:
+        base = ImageOps.invert(base)
+    gray = ImageOps.grayscale(base)
+    if sharpen:
+        gray = gray.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+    # Variant A: autocontrast
+    varA = ImageOps.autocontrast(gray)
+    # Variant B: Otsu-like via threshold (approx using point + histogram)
+    varB = varA.point(lambda x: 255 if x > 180 else 0)
+    # Variant C: adaptive-like (simulate by increasing contrast then light blur)
+    varC = ImageOps.autocontrast(gray).filter(ImageFilter.MedianFilter(size=3))
+    return [varA, varB, varC]
+
+def ocr_try(img: Image.Image, psm: int) -> Tuple[list, int, int]:
+    """Return (lines, num_tokens, num_lines) for this attempt."""
+    cfg = f"--oem 1 --psm {psm} -l eng -c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.'- "
+    df = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME, config=cfg)
     if df is None or df.empty or "text" not in df.columns:
-        return []
+        return [], 0, 0
     df = df.dropna(subset=["text"])
     df = df[df["text"].str.strip() != ""]
     if df.empty:
-        return []
-
-    group_cols = ["page_num", "block_num", "par_num", "line_num"]
+        return [], 0, 0
+    group_cols = ["page_num","block_num","par_num","line_num"]
     lines = (
         df.sort_values(["page_num","block_num","par_num","line_num","word_num"])
           .groupby(group_cols)["text"]
           .apply(lambda toks: " ".join(str(t) for t in toks))
           .reset_index()["text"].tolist()
     )
+    token_count = int(df.shape[0])
+    return lines, token_count, len(lines)
 
-    # Strict name chunks
-    pattern = re.compile(r"[A-Za-z][A-Za-z'\\-]+\\s+[A-Z]\\.|[A-Z]\\.\\s*[A-Za-z][A-Za-z'\\-]+")
+def try_all(img: Image.Image, crop_box, scale: float, invert: bool, sharpen: bool):
+    ensure_tesseract_available()
+    if crop_box:
+        img = img.crop(crop_box)
+    attempts = []
+    for rot in ROTATIONS:
+        rotated = img.rotate(rot, expand=True) if rot else img
+        for pre in preprocess_variants(rotated, scale=scale, invert=invert, sharpen=sharpen):
+            for psm in PSM_LIST:
+                lines, toks, nlines = ocr_try(pre, psm)
+                attempts.append({
+                    "rotation": rot, "psm": psm, "tokens": toks, "lines": nlines, "lines_text": lines, "preview": pre
+                })
+    # pick the attempt with most tokens, then most lines
+    attempts.sort(key=lambda a: (a["tokens"], a["lines"]), reverse=True)
+    return attempts
+
+def extract_candidates_from_lines(lines: List[str], stopwords: Set[str]) -> List[str]:
     candidates = set()
+    # scan n-grams up to 4; this relaxed catch-all feeds exact-match downstream
     for ln in lines:
-        for m in pattern.finditer(ln):
-            chunk = m.group(0)
-            std = name_to_last_initial(chunk, stopwords)
-            if std:
-                candidates.add(std)
+        toks = re.findall(r"[A-Za-z][A-Za-z'\\-\\.]+", ln)
+        for i in range(len(toks)):
+            for j in range(i+1, min(i+4, len(toks))+1):
+                chunk = " ".join(toks[i:j])
+                std = name_to_last_initial(chunk, stopwords)
+                if std:
+                    candidates.add(std)
     return sorted(candidates)
 
 def normalize_excel_names(df: pd.DataFrame, name_col: str, stopwords: Set[str]) -> Set[str]:
@@ -141,14 +181,23 @@ with right:
     y0 = st.slider("Crop top %", 0, 40, 12)
     y1 = st.slider("Crop bottom %", 60, 100, 95)
 
-run = st.button("Compare (strict exact-match)", type="primary", use_container_width=True)
+advanced = st.expander("OCR Advanced", expanded=False)
+with advanced:
+    scale = st.slider("Upscale image", 1.0, 3.0, 1.8, step=0.1)
+    invert = st.checkbox("Invert colors", value=False)
+    sharpen = st.checkbox("Sharpen", value=True)
+    show_attempts = st.checkbox("Show best attempt details", value=True)
+    show_lines = st.checkbox("Show OCR lines", value=False)
+    show_candidates = st.checkbox("Show OCR candidates", value=False)
+
+run = st.button("Compare (Robust)", type="primary", use_container_width=True)
 
 if run:
     if excel_file is None or image_file is None:
         st.error("Please upload both the Excel/CSV and the screenshot image.")
         st.stop()
 
-    # Full stopword set
+    # Stopwords
     user_stops = {s.strip().lower() for s in extra_stops.split(",") if s.strip()}
     stopwords = BASE_STOPWORDS | user_stops
 
@@ -171,46 +220,46 @@ if run:
 
     W, H = img.size
     crop_box = (int(W*x0/100), int(H*y0/100), int(W*x1/100), int(H*y1/100))
-    ocr_candidates = ocr_names(img, crop_box, stopwords)
+    attempts = try_all(img, crop_box, scale, invert, sharpen)
 
-    # STRICT EXACT MATCH: keep only OCR names that exactly match an Excel normalized name
-    ocr_exact = sorted(set(n for n in ocr_candidates if n in excel_names))
+    if not attempts:
+        st.error("OCR made no progress. Try widening the crop, increasing upscale, or toggling invert.")
+        st.stop()
 
-    # Possible OCR typos: same surname found, but initial doesn't match any Excel entry
-    excel_by_surname: Dict[str, Set[str]] = {}
-    for n in excel_names:
-        last, initial = n.rsplit(" ", 1)
-        excel_by_surname.setdefault(last, set()).add(initial)
+    best = attempts[0]
+    if show_attempts:
+        st.subheader("Best OCR attempt")
+        st.write({"rotation": best["rotation"], "psm": best["psm"], "tokens": best["tokens"], "lines": best["lines"]})
 
-    typos = []
-    for n in ocr_candidates:
-        last, initial = n.rsplit(" ", 1)
-        if last in excel_by_surname and n not in excel_names:
-            typos.append({"ocr": n, "excel_expected": sorted(excel_by_surname[last])})
+    lines = best["lines_text"]
+
+    if show_lines:
+        st.subheader("OCR lines (best attempt)")
+        st.write(lines)
+
+    candidates = extract_candidates_from_lines(lines, stopwords)
+    if show_candidates:
+        st.subheader("OCR candidates (normalized)")
+        st.write(candidates)
+
+    exact_matches = sorted(set(n for n in candidates if n in excel_names))
 
     st.subheader("Excel normalized names")
     st.write(sorted(excel_names))
 
-    st.subheader("OCR normalized names (exact matches only)")
-    st.write(ocr_exact)
+    st.subheader("OCR normalized names (exact matches)")
+    st.write(exact_matches)
 
-    # Mismatches (under strict mode)
-    missing_on_website = sorted(excel_names - set(ocr_exact))
-    extra_on_website = []  # by definition we don't report extras; strict mode only keeps known names
+    missing_on_website = sorted(excel_names - set(exact_matches))
 
     c1, c2 = st.columns(2)
     with c1:
-        st.metric("In Excel but not on website (strict)", len(missing_on_website))
+        st.metric("In Excel but not on website", len(missing_on_website))
         st.write(missing_on_website[:80])
     with c2:
-        st.metric("On website but not in Excel (strict)", 0)
-        st.caption("Strict mode suppresses extras by design. See 'Possible OCR typos' below.")
-
-    # Possible OCR errors
-    if typos:
-        st.subheader("Possible OCR typos (same surname, different initial)")
-        st.dataframe(pd.DataFrame(typos))
-
+        st.metric("On website but not in Excel", 0)
+        st.caption("Exact-match mode suppresses extras.")
+    
     # Downloads
     st.markdown("---")
     if missing_on_website:
