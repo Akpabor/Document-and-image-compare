@@ -10,7 +10,7 @@ from pytesseract import TesseractNotFoundError
 
 st.set_page_config(page_title="Excel ↔ Lineup Comparator (Robust OCR, Fixed)", layout="wide")
 st.title("Excel ↔ Lineup Comparator (Robust OCR, Fixed)")
-st.caption("Fixes Tesseract config quoting; tries multiple OCR strategies and exact-matches to Excel.")
+st.caption("Fixes Tesseract config quoting and string handling; tries multiple OCR strategies, then exact-matches to Excel.")
 
 BASE_STOPWORDS = {
     "home","farm","heart","sacred","lineup","timeline","info","table","h2h","matches",
@@ -99,13 +99,16 @@ def preprocess_variants(img, scale: float, invert: bool, sharpen: bool):
     return [varA, varB, varC]
 
 def ocr_try(img, psm: int):
-    # FIX: quote the whitelist value so shlex doesn't choke on the apostrophe
     whitelist = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.'- "
     cfg = f"--oem 1 --psm {psm} -l eng -c tessedit_char_whitelist=\"{whitelist}\""
     df = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME, config=cfg)
     if df is None or df.empty or "text" not in df.columns:
         return [], 0, 0
+    # Ensure string dtype for safe .str ops
     df = df.dropna(subset=["text"])
+    if df.empty:
+        return [], 0, 0
+    df["text"] = df["text"].astype(str)
     df = df[df["text"].str.strip() != ""]
     if df.empty:
         return [], 0, 0
