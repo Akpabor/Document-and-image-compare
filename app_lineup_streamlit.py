@@ -1,27 +1,23 @@
 import io, re, unicodedata
-from typing import List, Optional, Set
+from typing import List, Optional, Tuple, Set
 
 import streamlit as st
 import pandas as pd
 from PIL import Image
 
 # OCR
-try:
-    import pytesseract
-    TESS_AVAILABLE = True
-except Exception:
-    TESS_AVAILABLE = False
+import pytesseract
+from pytesseract import TesseractNotFoundError
 
-st.set_page_config(page_title="Excel ↔ Lineup Screenshot Comparator", layout="wide")
-st.title("Excel ↔ Lineup Screenshot Comparator")
-st.caption("Upload your **Excel/CSV roster** and a **lineup screenshot (PNG/JPG)**. I'll OCR the image, normalize names, and compare.")
+st.set_page_config(page_title="Excel ↔ Website Lineup Comparator", layout="wide")
+st.title("Excel ↔ Website Lineup Comparator")
+st.caption("Upload your **Excel roster** and a **website screenshot (PNG/JPG)** of the lineup. I'll OCR the image, extract names, normalize them, and compare.")
 
-with st.expander("How it works"):
+with st.expander("What it does", expanded=False):
     st.markdown("""
 - Extracts **player names** from the screenshot using OCR (Tesseract).
-- Normalizes all names into the form **`lastname f.`**.
-- Compares Excel roster vs OCR lineup, showing missing/extra players.
-- Allows downloading CSVs of mismatches.
+- Normalizes both sources to **`lastname f.`** (Last name + first initial) for robust matching.
+- Compares sets: who is **in Excel but missing online**, and **online but not in Excel**.
 """)
 
 # ---------- Helpers ----------
@@ -33,6 +29,7 @@ def normalize_text(s: str) -> str:
     return s
 
 def name_to_last_initial(name: str) -> Optional[str]:
+    """Convert a human name into 'lastname f.' format (lowercase, no accents)."""
     if not isinstance(name, str) or not name.strip():
         return None
     s = normalize_text(name)
@@ -55,24 +52,41 @@ def name_to_last_initial(name: str) -> Optional[str]:
 
     parts = [p for p in re.split(r"\s+", s) if p and p not in {"fc","lsl"}]
     if len(parts) >= 2:
-        first = parts[0]; last = parts[-1]
+        first = parts[0]
+        last = parts[-1]
         return f"{last} {first[0]}."
     return None
 
+def ensure_tesseract_available():
+    """Raise a clean, user-facing error if the Tesseract binary is missing."""
+    try:
+        _ = pytesseract.get_tesseract_version()
+    except TesseractNotFoundError as e:
+        st.error(
+            "Tesseract OCR isn't installed or not on PATH.\n\n"
+            "• **Streamlit Cloud**: add a `packages.txt` with `tesseract-ocr`\n"
+            "• **Ubuntu/Debian**: `sudo apt-get install tesseract-ocr`\n"
+            "• **macOS (Homebrew)**: `brew install tesseract`\n"
+            "• **Windows**: install the UB Mannheim Tesseract build and add it to PATH"
+        )
+        st.stop()
+
 def extract_names_from_image(img: Image.Image) -> List[str]:
-    if not TESS_AVAILABLE:
-        return []
+    ensure_tesseract_available()
     df = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME)
     if df is None or df.empty or "text" not in df.columns:
         return []
-    df = df.dropna(subset=["text"])
+    df = df.dropna(subset=["text"])  # remove NaNs
     df = df[df["text"].str.strip() != ""]
     if df.empty:
         return []
-    lines = (df.sort_values(["page_num","block_num","par_num","line_num","word_num"])
-               .groupby(["page_num","block_num","par_num","line_num"])["text"]
-               .apply(lambda toks: " ".join(str(t) for t in toks))
-               .reset_index()["text"].tolist())
+    group_cols = ["page_num", "block_num", "par_num", "line_num"]
+    lines = (
+        df.sort_values(["page_num","block_num","par_num","line_num","word_num"])
+          .groupby(group_cols)["text"]
+          .apply(lambda toks: " ".join(str(t) for t in toks))
+          .reset_index()["text"].tolist()
+    )
     candidates = set()
     for ln in lines:
         toks = re.findall(r"[A-Za-z][A-Za-z'\-\.]+", ln)
@@ -103,15 +117,11 @@ def read_excel(uploaded) -> pd.DataFrame:
     return df
 
 # ---------- UI ----------
-
 col1, col2 = st.columns(2)
 with col1:
     excel_file = st.file_uploader("Excel/CSV roster", type=["xlsx","xls","csv"])
 with col2:
-    image_file = st.file_uploader("Lineup screenshot (PNG/JPG)", type=["png","jpg","jpeg"])
-
-if not TESS_AVAILABLE:
-    st.info("Tesseract OCR not detected. Install it locally to extract names from images.")
+    image_file = st.file_uploader("Website lineup screenshot (PNG/JPG)", type=["png","jpg","jpeg"])
 
 if excel_file is not None:
     df = read_excel(excel_file)
@@ -126,10 +136,10 @@ run = st.button("Compare", type="primary", use_container_width=True)
 
 if run:
     if df is None or image_file is None:
-        st.error("Please upload both the Excel/CSV and the screenshot.")
+        st.error("Please upload both the Excel/CSV and the screenshot image.")
         st.stop()
     if not roster_col:
-        st.error("Please select the roster column in Excel/CSV.")
+        st.error("Please select the roster column in your Excel/CSV.")
         st.stop()
 
     excel_names = to_last_initial_set_from_excel(df, roster_col)
@@ -145,7 +155,7 @@ if run:
     st.subheader("Normalized roster (Excel)")
     st.write(sorted(excel_names))
 
-    st.subheader("Normalized lineup (Screenshot OCR)")
+    st.subheader("Normalized lineup (Image OCR)")
     st.write(sorted(ocr_names))
 
     missing_on_website = sorted(excel_names - ocr_names)
